@@ -1,0 +1,28 @@
+server:
+  port: 8085
+spring:
+  application:
+    name: itemservice
+  datasource:
+    url: jdbc:mysql://192.168.1.8:3306/test?useSSL=false&useUnicode=true&characterEncoding=utf-8
+    username: root
+    password: "xxxxxxxx"
+    driver-class-name: com.mysql.jdbc.Driver
+  redis:
+    host: 192.168.1.8
+mybatis-plus:
+  type-aliases-package: com.heima.item.pojo
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      update-strategy: not_null
+      id-type: auto
+logging:
+  level:
+    com.heima: debug
+  pattern:
+    dateformat: HH:mm:ss:SSS
+canal:
+  destination: test
+  server: 192.168.1.9:11111
