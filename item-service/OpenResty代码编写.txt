@@ -1,0 +1,194 @@
+Nginx负载均衡服务器配置：
+#user  nobody;
+worker_processes  1;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    #tcp_nopush     on;
+    keepalive_timeout  65;
+
+    upstream nginx-cluster{
+        server 192.168.1.8:81;
+    }
+
+    server {
+        listen       80;
+        server_name  localhost;
+	location /api {
+            proxy_pass http://nginx-cluster;
+        }
+        location / {
+            root   html;
+            index  index.html index.htm;
+        }
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+    }
+}
+
+=============================================================
+
+Nginx集群配置：
+#user  nobody;
+worker_processes  1;
+error_log  logs/error.log;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+	#lua 模块
+	lua_package_path "/usr/local/openresty/lualib/?.lua;;";
+	#c模块
+	lua_package_cpath "/usr/local/openresty/lualib/?.so;;";
+	# 共享字典，也就是本地缓存，名称叫做：item_cache，大小150m
+	lua_shared_dict item_cache 150m;
+
+	upstream tomcat-cluster {
+		hash $request_uri;
+		server 192.168.1.7:8085;
+		server 192.168.1.7:8086;
+	}
+
+    server {
+        listen       81;
+        server_name  localhost;
+	location /item {
+	proxy_pass  http://tomcat-cluster;
+	}
+        location ~ /api/item/(\d+) {
+            default_type  application/json;
+            content_by_lua_file  lua/item.lua;
+        }
+        location / {
+            root   html;
+            index  index.html index.htm;
+        }
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+    }
+}
+
+=============================================================
+
+/usr/local/openresty/nginx/lua/item.lua:
+-- 导入common函数库
+local common = require('common')
+local read_http = common.read_http
+local read_redis = common.read_redis
+-- 导入cjson库
+local cjson = require('cjson')
+-- 导入共享词典，本地缓存
+local item_cache = ngx.shared.item_cache
+
+-- 封装函数，先查询本地缓存，再查询redis，再查询http
+local function read_data(key, expire, path, params)
+    -- 读取本地缓存
+    local val = item_cache:get(key)
+    if not val then
+        -- 缓存未命中，记录日志
+        ngx.log(ngx.ERR, "本地缓存查询失败, key: ", key , ", 尝试redis查询")
+        -- 查询redis
+        val = read_redis("127.0.0.1", 6379, key)
+        -- 判断redis是否命中
+        if not val then
+            ngx.log(ngx.ERR, "Redis缓存查询失败, key: ", key , ", 尝试http查询")
+            -- Redis查询失败，查询http
+            val = read_http(path, params)
+        end
+    end
+    -- 写入本地缓存
+    item_cache:set(key, val, expire)
+    return val
+end
+
+local id = ngx.var[1]
+
+local itemJSON = read_data("item:id:" .. id, 1800, "/item/" .. id, nil)
+local stockJSON = read_data("item:stock:id:" .. id, 60, "/item/stock/" .. id, nil)
+
+local item = cjson.decode(itemJSON)
+local stock = cjson.decode(stockJSON)
+item.stock = stock.stock
+item.sold = stock.sold
+itemJSON = cjson.encode(item)
+
+ngx.say(itemJSON)
+
+=============================================================
+
+/usr/local/openresty/lualib/common.lua :
+local redis = require('resty.redis')
+local red = redis:new()
+red:set_timeouts(1000,1000,1000)
+
+-- 关闭redis连接的工具方法，其实是放入连接池
+local function close_redis(red)
+    local pool_max_idle_time = 10000 -- 连接的空闲时间，单位是毫秒
+    local pool_size = 100 --连接池大小
+    local ok, err = red:set_keepalive(pool_max_idle_time, pool_size)
+    if not ok then
+        ngx.log(ngx.ERR, "放入redis连接池失败: ", err)
+    end
+end
+
+-- 查询redis的方法 ip和port是redis地址，key是查询的key
+local function read_redis(ip, port, key)
+    -- 获取一个连接
+    local ok, err = red:connect(ip, port)
+    if not ok then
+        ngx.log(ngx.ERR, "连接redis失败 : ", err)
+        return nil
+    end
+    -- 查询redis
+    local resp, err = red:get(key)
+    -- 查询失败处理
+    if not resp then
+        ngx.log(ngx.ERR, "查询Redis失败: ", err, ", key = " , key)
+    end
+    --得到的数据为空处理
+    if resp == ngx.null then
+        resp = nil
+        ngx.log(ngx.ERR, "查询Redis数据为空, key = ", key)
+    end
+    close_redis(red)
+    return resp
+end
+
+-- 封装函数，发送http请求，并解析响应
+local function read_http(path, params)
+    local resp = ngx.location.capture(path,{
+        method = ngx.HTTP_GET,
+        args = params,
+    })
+    if not resp then
+        -- 记录错误信息，返回404
+        ngx.log(ngx.ERR, "http not found, path: ", path , ", args: ", args)
+        ngx.exit(404)
+    end
+    return resp.body
+end
+
+-- 将方法导出
+local _M = {
+    read_http = read_http,
+    read_redis = read_redis
+}
+return _M
+

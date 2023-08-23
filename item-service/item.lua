@@ -40,4 +40,3 @@ item.sold = stock.sold
 itemJSON = cjson.encode(item)
 
 ngx.say(itemJSON)
-
